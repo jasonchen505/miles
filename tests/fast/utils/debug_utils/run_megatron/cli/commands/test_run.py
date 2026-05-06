@@ -86,9 +86,10 @@ class TestRunImplExecCommand:
         assert "DUMPER_FILTER=logits" in cmd
 
     def test_cmd_contains_script_args(self) -> None:
-        run_impl(_make_run_args(role="critic"))
+        run_impl(_make_run_args(role="critic", top_k=5))
         cmd = self.mock_exec.call_args[0][0]
         assert "--script-role critic" in cmd
+        assert "--script-top-k 5" in cmd
 
     def test_routing_replay_nproc1_ok(self) -> None:
         run_impl(

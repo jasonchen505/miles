@@ -36,6 +36,7 @@ from miles.utils.debug_utils.run_megatron.worker.replay import (
     setup_replay_before_model,
 )
 from miles.utils.debug_utils.run_megatron.worker.script_args import WORKER_SCRIPT_ARGS_BRIDGE, WorkerScriptArgs
+from miles.utils.debug_utils.run_megatron.worker.top_k_print import print_top_k
 
 
 def main() -> None:
@@ -68,12 +69,22 @@ def main() -> None:
     if rank == 0:
         print(f"[worker] input_ids shape={batch['input_ids'].shape}", flush=True)
 
-    _run_forward_backward(
+    captured_logits: torch.Tensor | None = _run_forward_backward(
         args=args,
         script=script,
         model=model,
         batch=batch,
     )
+
+    is_last_pp_stage: bool = mpu.is_pipeline_last_stage()
+
+    if script.top_k > 0 and captured_logits is not None and is_last_pp_stage:
+        print_top_k(
+            logits=captured_logits,
+            input_ids=batch["input_ids"],
+            top_k=script.top_k,
+            tokenizer_path=script.hf_checkpoint,
+        )
 
     save_replay_data(script, rank=rank)
     _finalize_dumper()

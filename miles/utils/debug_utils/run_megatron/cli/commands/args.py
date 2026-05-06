@@ -29,6 +29,7 @@ class CommonRunArgs:
     apply_chat_template: bool = _field(default=False, help="Apply chat template")
     role: str = _field(default="actor", help="Model role: actor / critic")
     source_patcher_config: Path | None = _field(default=None, help="Source patcher YAML config path")
+    top_k: int = _field(default=0, help="Print top-k predictions per position (0=disabled)")
     dumper_filter: str = _field(default="", help="Dumper filter expression")
     megatron_path: Path | None = _field(default=None, help="Path to Megatron-LM")
     extra_args: str = _field(default="", help="Extra args passed to worker")

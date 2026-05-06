@@ -15,6 +15,7 @@ class TestWorkerScriptArgs:
     def test_defaults(self) -> None:
         args = WorkerScriptArgs(hf_checkpoint=Path("/hf"), token_ids_file=Path("/tokens.json"))
         assert args.role == "actor"
+        assert args.top_k == 0
         assert args.run_backward is False
         assert args.ref_load is None
         assert args.source_patcher_config is None
@@ -27,6 +28,7 @@ class TestWorkerScriptArgs:
             token_ids_file=Path("/tokens.json"),
             role="critic",
             run_backward=True,
+            top_k=5,
         )
         cli_str = WORKER_SCRIPT_ARGS_BRIDGE.to_cli_args(original)
 
