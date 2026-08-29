@@ -18,7 +18,7 @@ __all__ = [
 ]
 
 # Only these two parameters may be passed positionally; everything else
-# (labels, always_on, nightly, disabled) is keyword-only.
+# (labels, nightly, disabled) is keyword-only.
 _POSITIONAL_PARAMS = ("est_time", "suite")
 
 # All accepted keyword arguments (in addition to the positional pair above).
@@ -60,10 +60,12 @@ def register_cpu_ci(
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op).
 
-    `labels=None` and `labels=[]` are equivalent: the test runs on every PR
-    regardless of `run-ci-*` labels. A non-empty `labels` list gates the test
-    on PR labels — the test runs when the PR carries `run-ci-<x>` for any
-    `<x>` in `labels`.
+    `labels=None` and `labels=[]` are equivalent for CPU tests: the test is
+    always-on within every cadence that admits it. A non-empty `labels` list
+    gates the test on the resolved domain scope; a PR can include `<x>` with
+    `run-ci-<x>`, while broad scopes include many domain labels at once.
+    `nightly=True` adds a cadence gate: regular runs exclude the test, while
+    nightly and weekly runs include it alongside regular registrations.
     """
     return None
 
@@ -72,13 +74,14 @@ def register_cuda_ci(
     est_time: float,
     suite: str,
     *,
-    labels: list[str] | None = None,
+    labels: list[str],
     nightly: bool = False,
     disabled: str | None = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op).
 
-    See `register_cpu_ci` for label semantics.
+    `labels` must contain at least one domain label so GPU tests run only when
+    an explicit or broad scope selects them.
     """
     return None
 
@@ -87,13 +90,14 @@ def register_rocm_ci(
     est_time: float,
     suite: str,
     *,
-    labels: list[str] | None = None,
+    labels: list[str],
     nightly: bool = False,
     disabled: str | None = None,
 ):
     """Marker for ROCm CI registration (parsed via AST; runtime no-op).
 
-    See `register_cpu_ci` for label semantics.
+    `labels` must contain at least one domain label so GPU tests run only when
+    an explicit or broad scope selects them.
 
     """
     return None
@@ -192,11 +196,14 @@ class RegistryVisitor(ast.NodeVisitor):
         if not isinstance(parsed["suite"], str):
             raise ValueError(f"{self.filename}: suite must be a string in {func_name}()")
 
-        # `labels` is optional. Missing / None / [] all mean "always run on
-        # every PR"; only a non-empty list gates the test on PR labels.
+        # CPU labels remain optional; GPU registrations require an explicit
+        # non-empty domain so they cannot consume runners on every PR.
         labels = parsed.get("labels", [])
         if not isinstance(labels, list):
             raise ValueError(f"{self.filename}: labels must be a list or None in {func_name}()")
+        backend = _REGISTER_BACKEND_MAP[func_name]
+        if backend != HWBackend.CPU and not labels:
+            raise ValueError(f"{self.filename}: labels in {func_name}() must contain at least one domain label")
 
         nightly = parsed.get("nightly", False)
         if not isinstance(nightly, bool):
@@ -217,7 +224,7 @@ class RegistryVisitor(ast.NodeVisitor):
             )
 
         return CIRegistry(
-            backend=_REGISTER_BACKEND_MAP[func_name],
+            backend=backend,
             filename=self.filename,
             est_time=float(parsed["est_time"]),
             suite=parsed["suite"],

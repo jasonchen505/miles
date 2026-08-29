@@ -6,13 +6,18 @@ import uuid
 
 from sglang_router.launch_router import RouterArgs
 
-from miles.rollout.session.session_server import run_session_server
+from miles.rollout.session.server import run_session_server
 from miles.router.router import run_router as run_miles_router
 from miles.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, is_port_available
 from miles.utils.http_utils import run_router as run_sglang_router
 from miles.utils.http_utils import wait_for_server_ready
 
 logger = logging.getLogger(__name__)
+
+# Readiness budget for the spawned router/session-server children. The spawn
+# context re-imports the heavy transformers/megatron chain (~13s typical in
+# CI), and transient CI stalls have pushed startup past a 30s budget.
+_SERVER_READY_TIMEOUT_SECS = 120
 
 
 def start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
@@ -72,17 +77,28 @@ def start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool =
     )
     process.daemon = True
     process.start()
-    wait_for_server_ready(router_ip, router_port, process, timeout=30)
+    wait_for_server_ready(router_ip, router_port, process, timeout=_SERVER_READY_TIMEOUT_SECS)
     logger.info(f"Router launched at {router_ip}:{router_port}")
     return router_ip, router_port
 
 
-def start_session_server(args):
-    """Start a standalone session server when ``--use-session-server`` is set.
+def _resolve_session_server_ports(start: int | None, workers: int) -> list[int]:
+    """Return the requested number of consecutive ports from the configured or auto-selected start."""
+    if workers < 1:
+        raise ValueError("--session-server-workers must be at least 1.")
+    # TODO(#1837): Refactor IP/port allocation; keep this naive for now.
+    if start is None:
+        start = find_available_port(random.randint(5000, 6000))
+    return list(range(start, start + workers))
 
-    The session server runs as a separate process with its own port and proxies
-    inference requests directly to SGLang worker engines.  It is always started
-    as a standalone process regardless of whether ``--use-miles-router`` is active.
+
+def start_session_server(args):
+    """Start the standalone session servers when ``--use-session-server`` is set.
+
+    One independent single-process server per resolved port; the rollout side
+    picks one per session and its URL carries the affinity from then on.
+    Always started standalone regardless of whether ``--use-miles-router`` is
+    active.
     """
     if not getattr(args, "use_session_server", False):
         return
@@ -93,23 +109,39 @@ def start_session_server(args):
 
     if getattr(args, "session_server_ip", None) is None:
         args.session_server_ip = args.sglang_router_ip
-    if getattr(args, "session_server_port", None) is None:
-        args.session_server_port = find_available_port(random.randint(5000, 6000))
-    if getattr(args, "session_server_instance_id", None) is None:
-        args.session_server_instance_id = uuid.uuid4().hex
 
-    ip, port = args.session_server_ip, args.session_server_port
-    if not is_port_available(port):
-        raise RuntimeError(
-            f"Port {port} is already in use — a stale session server may still be running. "
-            f"Run 'pkill -9 python' to kill it, then retry."
-        )
+    ip = args.session_server_ip
+    ports = _resolve_session_server_ports(args.session_server_port, args.session_server_workers)
+    for port in ports:
+        if not is_port_available(port):
+            raise RuntimeError(
+                f"Port {port} is already in use — a stale session server may still be running. "
+                f"Run 'pkill -9 python' to kill it, then retry."
+            )
+    # The canonical driver-side value; rollout code picks from this list.
+    args.session_server_ports = ports
 
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
 
+    # Spawn all children before waiting on any: each child pays the ~10s
+    # transformers import, so N servers start in ~one import of wall-time.
     # spawn (not fork): see start_router for rationale.
-    process = multiprocessing.get_context("spawn").Process(target=run_session_server, args=(args, router_url))
-    process.daemon = True
-    process.start()
-    wait_for_server_ready(ip, port, process, timeout=30)
-    logger.info(f"Session server launched at {ip}:{port}")
+    instance_ids: dict[int, str] = {}
+    processes = []
+    for port in ports:
+        child_args = copy.copy(args)
+        child_args.session_server_port = port
+        child_args.session_server_instance_id = uuid.uuid4().hex
+        instance_ids[port] = child_args.session_server_instance_id
+        process = multiprocessing.get_context("spawn").Process(
+            target=run_session_server, args=(child_args, router_url)
+        )
+        process.daemon = True
+        process.start()
+        processes.append((port, process))
+    # The per-port map OpenAIEndpointTracer.create reads instance ids from,
+    # replacing the per-session /health probe.
+    args.session_server_instance_ids = instance_ids
+    for port, process in processes:
+        wait_for_server_ready(ip, port, process, timeout=_SERVER_READY_TIMEOUT_SECS)
+    logger.info(f"Session servers launched at {ip}, ports {ports} ({len(ports)} instances)")

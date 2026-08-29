@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from miles.backends.megatron_utils.lora_utils import LORA_ADAPTER_NAME, is_lora_weight_name
+from miles.backends.megatron_utils.lora_utils import is_lora_weight_name
 from miles.backends.megatron_utils.update_weight.common import _check_weight_sync_results
 from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast import (
     UpdateWeightFromDistributed,
@@ -25,6 +25,7 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
     DistBucketedWeightUpdateMixin,
 )
 from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+from miles.utils.lora import LORA_ADAPTER_NAME
 
 _UW_MODULE = "miles.backends.megatron_utils.update_weight.update_weight_from_tensor"
 _MIXIN_MODULE = "miles.backends.megatron_utils.update_weight.update_weight_from_distributed.mixin"
@@ -291,7 +292,7 @@ class TestFlattenedTensorBucketRoundTrip:
           - miles side: stop trusting ``supports_multi_dtypes`` in
             ``_send_to_colocated_engine`` and always group by dtype (matches
             the FSDP path's existing implementation in
-            ``experimental/fsdp_utils/update_weight_utils.py``).
+            ``fsdp_utils/update_weight_utils.py``).
           - sglang side: actually align ``storage_offset`` in reconstruction.
 
         Until one side is fixed, this test asserts the current observed

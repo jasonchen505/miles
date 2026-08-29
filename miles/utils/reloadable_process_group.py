@@ -38,11 +38,10 @@ def monkey_patch_torch_dist():
         else:
             # If no ranks specified, use all ranks in world
             ranks = list(range(dist.get_world_size()))
-
         if len(ranks) == 1:
             return group
 
-        group = ReloadableProcessGroup(group, ranks)
+        group = ReloadableProcessGroup(group, inner_args=args, inner_kwargs=kwargs)
         return group
 
     dist.new_group = new_group
@@ -112,15 +111,14 @@ def monkey_patch_torch_dist():
 class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     GROUPS = {}
 
-    def __init__(self, group, ranks):
+    def __init__(self, group, inner_args, inner_kwargs):
         super().__init__(
             rank=dist.get_rank(group),
             size=dist.get_world_size(group),
         )
         self.group = group
-        self.group_info = {
-            "ranks": ranks,
-        }
+        self.inner_args = inner_args
+        self.inner_kwargs = inner_kwargs
         pid = os.getpid()
         if pid not in ReloadableProcessGroup.GROUPS:
             ReloadableProcessGroup.GROUPS[pid] = []
@@ -155,7 +153,7 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         for reloadable_group in reloadable_groups:
             if reloadable_group.group is not None:
                 continue
-            group = old_new_group(ranks=reloadable_group.group_info["ranks"], backend="nccl")
+            group = old_new_group(*reloadable_group.inner_args, **reloadable_group.inner_kwargs)
             reloadable_group.group = group
 
     def rank(self) -> int:
@@ -261,6 +259,39 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     @bound_device_id.setter
     def bound_device_id(self, dev):
         self.group.bound_device_id = dev
+
+
+def _forward_remaining_collectives():
+    """Forward every ProcessGroup collective this class does not define itself.
+
+    Callers that resolved a collective before the monkey patch went on --
+    Megatron binds `dist_reduce_scatter_func` at import time -- hand the wrapper
+    straight to torch, which invokes the method on the group object. Anything
+    not overridden here reaches the C++ base, whose own backend map is empty,
+    and dies as "No backend type associated with device type cuda". A
+    hand-written forward list silently regrows that hole whenever torch renames
+    or adds a collective, which is how torch 2.13's *_single family got through.
+    """
+    skip = {"rank", "size", "name", "abort", "shutdown", "bound_device_id"}
+    for name in dir(dist.ProcessGroup):
+        if name.startswith("__") or name in skip:
+            continue
+        if name in vars(ReloadableProcessGroup):
+            continue
+        if not callable(getattr(dist.ProcessGroup, name, None)):
+            continue
+
+        def make(method):
+            def forward(self, *args, **kwargs):
+                return self._fwd(method, *args, **kwargs)
+
+            forward.__name__ = method
+            return forward
+
+        setattr(ReloadableProcessGroup, name, make(name))
+
+
+_forward_remaining_collectives()
 
 
 def destroy_process_groups():

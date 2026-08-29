@@ -4,7 +4,7 @@ description: Launch recipe for GLM-5 and GLM-5.1 (744 B / 40 B active) — Pytho
 ---
 ## 1. Model Introduction
 
-[GLM-5](https://huggingface.co/zai-org/GLM-5) is the most powerful language model in Zhipu AI's GLM series, scaling to 744 B parameters (40 B active) and integrating DeepSeek Sparse Attention (DSA) for long-context efficiency. [GLM-5.1](https://huggingface.co/zai-org/GLM-5.1) is the next-generation model for agentic engineering on top of GLM-5, sharing the same model architectures,
+[GLM-5](https://huggingface.co/zai-org/GLM-5) is the most powerful language model in Zhipu AI's GLM series, scaling to 744 B parameters (40 B active) and integrating DeepSeek Sparse Attention (DSA) for long-context efficiency. [GLM-5.1](https://huggingface.co/zai-org/GLM-5.1) is the next-generation model for agentic engineering on top of GLM-5, sharing the same model architecture. For the newer GLM-5.2 recipe, see [GLM-5.2](/models/glm/glm5-2).
 
 **Key highlights:**
 
@@ -32,7 +32,7 @@ python scripts/run_glm5_744b_a40b.py prepare --model-name GLM-5 --num-nodes 16
 
 ### 3.2 HF → Megatron `torch_dist` conversion
 
-Also handled by `prepare`. The launcher patches `config.json` to set `model_type=deepseek_v32` (`_process_glm_checkpoint`) before conversion — GLM-5 is loaded through the DeepseekV32 architecture path. Run `prepare-cp` afterwards on every node to copy the converted checkpoint from shared NFS to local disk.
+Also handled by `prepare`. Before conversion the launcher validates, via `_validate_glm_checkpoint`, that the checkpoint uses the native GLM-5 config (`model_type=glm_moe_dsa`, `architectures=[GlmMoeDsaForCausalLM]`) and fails fast if it does not, then converts it to the `glm5-744B-A40B` Megatron model type. Run `prepare-cp` afterwards on every node to copy the converted checkpoint from shared NFS to local disk.
 
 ## 4. Launch
 
@@ -57,7 +57,7 @@ python scripts/run_glm5_744b_a40b.py prepare-cp --model-name GLM-5 --num-nodes <
 python scripts/run_glm5_744b_a40b.py train      --model-name GLM-5 --num-nodes <N>
 ```
 
-The launcher's docstring says it's tested on **H200 / B200 / GB300**; the dataclass restricts `--hardware` to `{H200, B200, GB300}`.
+The recipe is tested on **H200 / B200 / GB300**; the `--hardware` flag accepts exactly these three values.
 
 ## 5. Recipe Configuration
 
@@ -113,5 +113,5 @@ The launcher exposes these as flags:
 ## 6. Pairs Well With
 
 - [PD Disaggregation](/advanced/pd-disaggregation) — on by default for `num_nodes ≥ 1`.
-- [Low Precision RL](/advanced/fp8-low-precision) — opt-in via `--fp8-rollout`.
+- [Low Precision RL](/advanced/low-precision) — opt-in via `--fp8-rollout`.
 - [Speculative Decoding](/advanced/speculative-decoding) — opt-in via `--enable-mtp`.

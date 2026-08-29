@@ -1,3 +1,4 @@
+import copy
 import logging
 import socket
 
@@ -5,13 +6,19 @@ import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from miles.utils.async_utils import eager_create_task
-
+from miles.utils.environ import enable_experimental_ft_trainer
 from ..utils.ray_utils import compute_ray_pin_head_options
-from .actor_group import RayTrainGroup
 from .rollout.rollout_manager import RolloutManager
 
 logger = logging.getLogger(__name__)
+
+
+def _select_train_group_class():
+    if enable_experimental_ft_trainer():
+        from miles.ray.train.group import RayTrainGroup
+    else:
+        from miles.ray.actor_group import RayTrainGroup
+    return RayTrainGroup
 
 
 @ray.remote(num_gpus=1)
@@ -41,8 +48,11 @@ def sort_key(x):
     return (node_ip_parts, gpu_id)
 
 
-def _create_placement_group(num_gpus):
+def _create_placement_group(num_gpus, is_rdt: bool = False):
     """Create a placement group with the specified number of GPUs."""
+    if num_gpus == 0:
+        return None, [], []
+
     bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
@@ -64,7 +74,16 @@ def _create_placement_group(num_gpus):
         ray.kill(actor)
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
+    if is_rdt:
+        # Give the trainer the node PACK filled, so rollout bundles land where GPUs
+        # are still free: RayEngine STRICT_PACKs its SchedulerActors onto the engine
+        # actor's node and deadlocks if nothing there is unreserved.
+        node_bundle_counts: dict = {}
+        for _, node_identifier, _ in bundle_infos:
+            node_bundle_counts[node_identifier] = node_bundle_counts.get(node_identifier, 0) + 1
+        sorted_bundle_infos = sorted(bundle_infos, key=lambda info: (-node_bundle_counts[info[1]], *sort_key(info)))
+    else:
+        sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
     pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
     # Map from logical index -> physical GPU ID
     pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
@@ -79,60 +98,58 @@ def _create_placement_group(num_gpus):
     return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
 
 
+def _get_placement_group_layout(args) -> tuple[int, int]:
+    actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+
+    if args.debug_train_only:
+        return actor_num_gpus, 0
+    if args.rollout_external:
+        if args.debug_rollout_only:
+            return 0, 0
+        return actor_num_gpus, actor_num_gpus
+    if args.debug_rollout_only:
+        return args.rollout_num_gpus, 0
+    if args.colocate:
+        return max(actor_num_gpus, args.rollout_num_gpus), 0
+    return actor_num_gpus + args.rollout_num_gpus + args.eval_num_gpus, actor_num_gpus
+
+
 def create_placement_groups(args):
     """Create placement groups for actor and rollout engines."""
 
-    num_gpus = 0
-    if args.debug_train_only:
-        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
-        rollout_offset = 0
-        if args.use_critic:
-            num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
-            critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
-    elif args.debug_rollout_only:
-        num_gpus = args.rollout_num_gpus
-        rollout_offset = 0
-    elif args.colocate:
-        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
-        rollout_offset = 0
-        if args.use_critic:
-            num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
-            critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
-    else:
-        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + args.rollout_num_gpus
-        rollout_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
-        if args.use_critic:
-            num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
-            critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
-            rollout_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
+    num_gpus, rollout_offset = _get_placement_group_layout(args)
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
-    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(
+        num_gpus, is_rdt=args.update_weight_transfer_mode == "rdt"
+    )
 
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
-    if args.use_critic:
-        critic_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[critic_offset:]
-        critic_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[critic_offset:]
-
-    return {
+    result = {
         "actor": (pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids),
-        "critic": (pg, critic_pg_reordered_bundle_indices, critic_pg_reordered_gpu_ids) if args.use_critic else None,
         "rollout": (pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
     }
+    result["critic"] = result["actor"] if args.use_critic else None
+    return result
 
 
 def allocate_train_group(
-    args, num_nodes, num_gpus_per_node, pg, role: str, with_ref: bool, with_opd_teacher: bool = False
+    args, num_nodes, num_gpus_per_node, pg, role: str, with_ref: bool, rollout_manager, with_opd_teacher: bool = False
 ):
-    return RayTrainGroup(
+    # RDT pins one NIXL/NCCL rank per physical GPU, so it cannot time-share a device
+    # with a colocated rollout the way the fractional reservation allows.
+    num_gpus_per_actor = 1 if args.update_weight_transfer_mode == "rdt" else 0.4
+    train_group_cls = _select_train_group_class()
+    return train_group_cls(
         args=args,
         num_nodes=num_nodes,
         num_gpus_per_node=num_gpus_per_node,
         pg=pg,
-        num_gpus_per_actor=0.4,
+        num_gpus_per_actor=num_gpus_per_actor,
         role=role,
         with_ref=with_ref,
+        rollout_manager=rollout_manager,
         with_opd_teacher=with_opd_teacher,
     )
 
@@ -145,32 +162,36 @@ async def create_training_models(args, pgs, rollout_manager):
         pg=pgs["actor"],
         role="actor",
         with_ref=args.kl_coef != 0 or args.use_kl_loss,
+        rollout_manager=rollout_manager,
         with_opd_teacher=args.use_opd and args.opd_type == "megatron",
     )
+    actor_start_rollout_ids = await actor_model.init()
+
     if args.use_critic:
+        critic_args = copy.deepcopy(args)
+        critic_args.kl_coef = 0
+        critic_args.use_opd = False
+        critic_args.disable_param_buffers_cpu_backup = False
         critic_model = allocate_train_group(
-            args=args,
+            args=critic_args,
             num_nodes=args.critic_num_nodes,
             num_gpus_per_node=args.critic_num_gpus_per_node,
             pg=pgs["critic"],
             role="critic",
             with_ref=False,
+            rollout_manager=None,
         )
-        critic_init_task = await eager_create_task(critic_model.init())
+        critic_start_rollout_ids = await critic_model.init()
     else:
         critic_model = None
 
-    start_rollout_ids = await actor_model.init()
+    start_rollout_ids = critic_start_rollout_ids if args.use_critic else actor_start_rollout_ids
 
     assert len(set(start_rollout_ids)) == 1
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
-    if args.use_critic:
-        await critic_init_task
-        await actor_model.connect(critic_model)
-
-    await actor_model.set_rollout_manager(rollout_manager)
+    await actor_model.set_rollout_manager()
     if args.rollout_global_dataset:
         await rollout_manager.load.remote(args.start_rollout_id - 1)
 
@@ -191,7 +212,9 @@ def create_rollout_manager(args, pg):
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))
-        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+        ray.get(
+            rollout_manager.check_weights.remote(action="reset_tensors", skip_list=args.check_weight_update_skip_list)
+        )
 
     if args.offload_rollout:
         ray.get(rollout_manager.offload.remote())

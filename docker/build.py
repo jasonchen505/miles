@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+import image_inputs
 import typer
 
 CACHE_DIR = "/tmp/miles-docker-cache"
@@ -45,21 +46,23 @@ VARIANTS = {
         "tag_postfix": "-cu12",
         "build_args": {
             "ENABLE_CUDA_13": "0",
-            "SGLANG_IMAGE_TAG": "v0.5.12-cu129",
-            "WHEELS_TAG_X86": "cu129-x86_64-v0.5.12",
+            "SGLANG_IMAGE_TAG": "v0.5.18-cu129",
+            "WHEELS_TAG_X86": "cu129-x86_64",
         },
     },
-    "rocm-mi350": {
+    "rocm700-mi35x": {
         "image": "rocm/sgl-dev",
-        "tag_postfix": "-rocm720-mi35x",
+        "tag_postfix": "-rocm700-mi35x",
         "tag_prefix": "miles",
         "dockerfile": "docker/Dockerfile.rocm",
         "build_args": {
             "GPU_ARCH": "gfx950",
-            "SGLANG_IMAGE_TAG": "v0.5.10-rocm720-mi35x",
+            "SGLANG_IMAGE_REPO": "rocm/sgl-dev",
+            "SGLANG_IMAGE_TAG": "v0.5.14-rocm700-mi35x-20260627",
+            "SGLANG_USE_ROCM700A": "1",
         },
     },
-    "rocm-mi300": {
+    "rocm700-mi30x": {
         "image": "rocm/sgl-dev",
         "tag_postfix": "-rocm700-mi30x",
         "tag_prefix": "miles",
@@ -67,6 +70,20 @@ VARIANTS = {
         "build_args": {
             "GPU_ARCH": "gfx942",
             "SGLANG_IMAGE_TAG": "v0.5.10-rocm700-mi30x",
+            "SGLANG_USE_ROCM700A": "1",
+        },
+    },
+    "rocm720-mi35x": {
+        "image": "rocm/sgl-dev",
+        "tag_postfix": "-rocm720-mi35x",
+        "tag_prefix": "miles",
+        "dockerfile": "docker/Dockerfile.rocm",
+        "build_args": {
+            "GPU_ARCH": "gfx950",
+            "SGLANG_IMAGE_REPO": "rocm/sgl-dev",
+            "SGLANG_IMAGE_TAG": "v0.5.16-rocm720-mi35x-20260730",
+            "APPLY_ROCR_VMMFIX": "1",
+            "TE_USE_WHEEL": "1",
         },
     },
 }
@@ -80,8 +97,15 @@ def run(cmd: list[str], dry_run: bool) -> None:
 
 
 def build_and_push(
-    variant: str, image_tag: str, dry_run: bool, dockerfile: str, push: bool = False, custom_tag: str = ""
+    variant: str,
+    image_tag: str,
+    dry_run: bool,
+    dockerfile: str,
+    push: bool = False,
+    custom_tag: str = "",
+    extra_build_args: list[str] | None = None,
 ) -> None:
+    extra_build_args = extra_build_args or []
     config = VARIANTS[variant]
     # A variant may pin its own Dockerfile (e.g. ROCm); otherwise use the CLI default.
     dockerfile = config.get("dockerfile", dockerfile)
@@ -128,6 +152,15 @@ def build_and_push(
     for key, value in config.get("build_args", {}).items():
         cmd += ["--build-arg", f"{key}={value}"]
 
+    # Caller overrides (e.g. release builds pinning SGLANG_COMMIT / MILES_COMMIT
+    # from release-lock.json) come last so they win over variant defaults.
+    for spec in extra_build_args:
+        assert "=" in spec, f"--build-arg expects KEY=VALUE, got {spec!r}"
+        cmd += ["--build-arg", spec]
+
+    # CI reads this back off the published tag to skip rebuilds whose inputs are unchanged.
+    cmd += ["--label", f"{image_inputs.LABEL_KEY}={image_inputs.compute()}"]
+
     for tag in tags:
         cmd += ["-t", tag]
 
@@ -143,8 +176,9 @@ class Variant(str, Enum):
     cu13_x86 = "cu13-x86"
     cu13_aarch64 = "cu13-aarch64"
     cu12_x86 = "cu12-x86"
-    rocm_mi350 = "rocm-mi350"
-    rocm_mi300 = "rocm-mi300"
+    rocm700_mi35x = "rocm700-mi35x"
+    rocm700_mi30x = "rocm700-mi30x"
+    rocm720_mi35x = "rocm720-mi35x"
 
 
 class ImageTag(str, Enum):
@@ -160,8 +194,17 @@ def main(
     dry_run: bool = typer.Option(False, help="Print commands without executing them."),  # noqa: B008
     push: bool = typer.Option(False, help="Push images to registry after building."),  # noqa: B008
     custom_tag: str = typer.Option("", help="Custom tag name (required when --image-tag is custom)."),  # noqa: B008
+    build_arg: list[str] = typer.Option([], help="Extra KEY=VALUE build-arg (repeatable)."),  # noqa: B008
 ) -> None:
-    build_and_push(variant.value, image_tag.value, dry_run, dockerfile, push=push, custom_tag=custom_tag)
+    build_and_push(
+        variant.value,
+        image_tag.value,
+        dry_run,
+        dockerfile,
+        push=push,
+        custom_tag=custom_tag,
+        extra_build_args=build_arg,
+    )
 
 
 if __name__ == "__main__":
