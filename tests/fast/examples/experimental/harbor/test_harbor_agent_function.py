@@ -90,8 +90,9 @@ def tasks_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("HARBOR_ENV_TYPE", "e2b")
     # so tests never read a real key file from the developer's machine
     monkeypatch.setenv("E2B_API_KEY", "test-key")
-    monkeypatch.delenv("MILES_ROUTER_EXTERNAL_HOST", raising=False)
     monkeypatch.delenv("HARBOR_ENV_KWARGS", raising=False)
+    monkeypatch.delenv("HARBOR_CPU_ENFORCEMENT_POLICY", raising=False)
+    monkeypatch.delenv("HARBOR_MEMORY_ENFORCEMENT_POLICY", raising=False)
     return tmp_path
 
 
@@ -121,12 +122,72 @@ def _verdict(reward=1.0, **agent_fields):
 
 
 def test_environment_type_is_passed_straight_through(tasks_dir, monkeypatch):
-    monkeypatch.setenv("HARBOR_ENV_TYPE", "daytona")
-    monkeypatch.setenv("HARBOR_ENV_KWARGS", '{"auto_snapshot": true}')
+    monkeypatch.setenv("HARBOR_ENV_TYPE", "modal")
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", '{"passthrough_probe": 1}')
     cfg = haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
-    assert cfg.environment.type.value == "daytona"
-    assert cfg.environment.kwargs == {"auto_snapshot": True}
+    assert cfg.environment.type.value == "modal"
+    assert cfg.environment.kwargs == {"passthrough_probe": 1}
     assert cfg.environment.delete is True
+
+
+def test_daytona_reclaim_timer_outlasts_the_trial_cap(tasks_dir, monkeypatch):
+    """Harbor's Daytona defaults never reclaim a sandbox a killed worker left
+    behind; ours must, without ever stopping a live trial."""
+    monkeypatch.setenv("HARBOR_ENV_TYPE", "daytona")
+    monkeypatch.setenv("AGENT_TRIAL_TIMEOUT", "1200")  # 20 minutes
+    cfg = haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
+    assert cfg.environment.kwargs == {"auto_stop_interval_mins": 50, "auto_delete_interval_mins": 1440}
+
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", '{"auto_stop_interval_mins": 45, "auto_snapshot": true}')
+    cfg = haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
+    assert cfg.environment.kwargs == {
+        "auto_stop_interval_mins": 45,  # the caller's value wins when it is safe
+        "auto_delete_interval_mins": 1440,
+        "auto_snapshot": True,
+    }
+
+    monkeypatch.setenv("HARBOR_ENV_KWARGS", '{"auto_stop_interval_mins": 20}')
+    with pytest.raises(ValueError, match="mid-trial"):
+        haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
+
+
+def test_reclaim_timers_are_daytona_only(tasks_dir, monkeypatch):
+    monkeypatch.setenv("HARBOR_ENV_TYPE", "e2b")
+    cfg = haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
+    assert cfg.environment.kwargs == {}
+
+
+@pytest.mark.parametrize(
+    "var, field, value",
+    [
+        ("HARBOR_OVERRIDE_CPUS", "override_cpus", 2),
+        ("HARBOR_OVERRIDE_MEMORY_MB", "override_memory_mb", 20480),
+        ("HARBOR_OVERRIDE_STORAGE_MB", "override_storage_mb", 10240),
+    ],
+)
+def test_resource_overrides_reach_harbor_and_reject_nonpositive(tasks_dir, monkeypatch, var, field, value):
+    monkeypatch.setenv(var, str(value))
+    cfg = haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
+    assert getattr(cfg.environment, field) == value
+
+    monkeypatch.setenv(var, "0")
+    with pytest.raises(ValueError, match=var):
+        haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
+
+
+@pytest.mark.parametrize(
+    "var, field",
+    [
+        ("HARBOR_CPU_ENFORCEMENT_POLICY", "cpu_enforcement_policy"),
+        ("HARBOR_MEMORY_ENFORCEMENT_POLICY", "memory_enforcement_policy"),
+    ],
+)
+def test_resource_enforcement_policies_reach_harbor(tasks_dir, monkeypatch, var, field):
+    monkeypatch.setenv(var, "request")
+
+    cfg = haf.build_trial_config({"instance_id": "task-1", "agent_name": "mini-swe-agent"}, "http://s/v1", {})
+
+    assert getattr(cfg.environment, field) == "request"
 
 
 def test_unknown_environment_type_is_an_error_not_docker(tasks_dir, monkeypatch):
@@ -257,13 +318,12 @@ def test_harbor_exceptions_map_to_the_exit_status_vocabulary(exc_type, exit_stat
 # --- entry -----------------------------------------------------------------
 
 
-def test_run_returns_the_verdict_and_trial_dir(tasks_dir, fake_harbor, monkeypatch):
+def test_run_returns_the_verdict_and_trial_dir(tasks_dir, fake_harbor):
     fake_harbor.result = _verdict(reward=1.0)
-    monkeypatch.setenv("MILES_ROUTER_EXTERNAL_HOST", "trainer.tailnet")
 
     out = run_async(
         haf.run(
-            "http://10.0.0.1:30000/sessions/s1",
+            "http://trainer.tailnet:30000/sessions/s1",
             [],
             {"temperature": 0.8},
             {"instance_id": "task-1", "agent_name": "mini-swe-agent"},
@@ -273,7 +333,8 @@ def test_run_returns_the_verdict_and_trial_dir(tasks_dir, fake_harbor, monkeypat
     assert out["reward"] == 1.0 and out["exit_status"] == "Submitted"
     assert out["trial_dir"].endswith("task-1")
     (trial,) = fake_harbor.created
-    # in-sandbox agents call the model from inside the sandbox: the external host must be in the URL they get
+    # in-sandbox agents call the model from inside the sandbox: base_url already names the
+    # instance the way the sandbox reaches it, so it goes through with only /v1 appended
     assert trial.config.agent.env["OPENAI_API_BASE"] == "http://trainer.tailnet:30000/sessions/s1/v1"
 
 

@@ -27,7 +27,10 @@ from typing import Any, ClassVar
 import polars as pl
 import torch
 
-from miles.backends.training_utils.cp_utils import assemble_log_prob_from_cp, get_logits_and_tokens_offset_with_cp
+from miles.backends.training_utils.data.context_parallel import (
+    assemble_log_prob_from_cp,
+    get_logits_and_tokens_offset_with_cp,
+)
 from miles.utils.types import LEGACY_WEIGHT_VERSIONS_KEY, Sample, WeightVersionsPerCall
 
 
@@ -819,7 +822,7 @@ class DumpReader:
             tool_calls=_tool_call_count(sample),
             non_generation_time=sample.non_generation_time,
             spec_accept_rate=(
-                spec.spec_accept_token_num / spec.spec_draft_token_num if spec.spec_draft_token_num else None
+                spec.spec_num_correct_drafts / spec.spec_num_proposed_drafts if spec.spec_num_proposed_drafts else None
             ),
             prefix_cache_hit_rate=(
                 cache_info.cached_tokens / cache_info.total_prompt_tokens if cache_info.total_prompt_tokens else None

@@ -58,14 +58,6 @@ class WeightVersionsPerCall:
 
 
 @dataclass(frozen=True)
-class AdapterRef:
-    """Which LoRA adapter a sample is bound to (training slot routing, inference lora_path); ``None`` = no adapter."""
-
-    name: str
-    slot: int
-
-
-@dataclass(frozen=True)
 class RewardSpec:
     """Per-sample spec of how the response is scored; intentionally decoupled from adapter routing."""
 
@@ -123,52 +115,58 @@ class Sample:
     # metadata used during training, e.g., what loss to use for this sample.
     train_metadata: dict | None = None
 
-    # MultiLoRA: which adapter this sample trains/infers with
-    adapter: AdapterRef | None = None
-    # Per-sample reward dispatch override (e.g., per-adapter RM in multi-LoRA)
+    # Per-sample reward dispatch override
     reward_spec: RewardSpec | None = None
 
     # Per-sample routing key for the router's consistent_hashing policy (sent as X-SMG-Routing-Key)
     routing_key: str | None = None
 
+    # Which policy model this sample trains and generates on; None when the run trains one policy
+    trainer_model_id: str | None = None
+
     non_generation_time: float = 0.0  # time spent in non-generation steps
 
     @dataclass
     class SpecInfo:
-        spec_accept_token_num: int = 0
-        spec_draft_token_num: int = 0
+        spec_num_correct_drafts: int = 0
+        spec_num_proposed_drafts: int = 0
         spec_verify_ct: int = 0
-        completion_token_num: int = 0
+        completion_tokens: int = 0
 
         @property
         def spec_accept_rate(self) -> float:
-            return self.spec_accept_token_num / self.spec_draft_token_num if self.spec_draft_token_num > 0 else 0.0
+            if self.spec_num_proposed_drafts == 0:
+                return 0.0
+            return self.spec_num_correct_drafts / self.spec_num_proposed_drafts
 
         @property
         def spec_accept_length(self) -> float:
-            return self.completion_token_num / self.spec_verify_ct if self.spec_verify_ct > 0 else 0.0
+            return self.completion_tokens / self.spec_verify_ct if self.spec_verify_ct > 0 else 0.0
 
         def add(self, meta_info: dict):
-            self.spec_accept_token_num += meta_info.get("spec_accept_token_num", 0)
-            self.spec_draft_token_num += meta_info.get("spec_draft_token_num", 0)
-            self.spec_verify_ct += meta_info.get("spec_verify_ct", 0)
-            self.completion_token_num += meta_info.get("completion_tokens", 0)
+            spec_verify_ct = meta_info.get("spec_verify_ct") or 0
+            if spec_verify_ct <= 0:
+                return
+            self.spec_num_correct_drafts += meta_info.get("spec_num_correct_drafts", 0)
+            self.spec_num_proposed_drafts += meta_info.get("spec_num_proposed_drafts", 0)
+            self.spec_verify_ct += spec_verify_ct
+            self.completion_tokens += meta_info.get("completion_tokens", 0)
 
         def to_dict(self):
             return {
-                "spec_accept_token_num": self.spec_accept_token_num,
-                "spec_draft_token_num": self.spec_draft_token_num,
+                "spec_num_correct_drafts": self.spec_num_correct_drafts,
+                "spec_num_proposed_drafts": self.spec_num_proposed_drafts,
                 "spec_verify_ct": self.spec_verify_ct,
-                "completion_token_num": self.completion_token_num,
+                "completion_tokens": self.completion_tokens,
             }
 
         @staticmethod
         def from_dict(data: dict):
             info = Sample.SpecInfo()
-            info.spec_accept_token_num = data.get("spec_accept_token_num", 0)
-            info.spec_draft_token_num = data.get("spec_draft_token_num", 0)
+            info.spec_num_correct_drafts = data.get("spec_num_correct_drafts", data.get("spec_accept_token_num", 0))
+            info.spec_num_proposed_drafts = data.get("spec_num_proposed_drafts", data.get("spec_draft_token_num", 0))
             info.spec_verify_ct = data.get("spec_verify_ct", 0)
-            info.completion_token_num = data.get("completion_token_num", 0)
+            info.completion_tokens = data.get("completion_tokens", data.get("completion_token_num", 0))
             return info
 
     spec_info: SpecInfo = field(default_factory=SpecInfo)
@@ -342,6 +340,7 @@ class Sample:
         self.rollout_routed_experts = None
         self.rollout_indexer_topk = None
         self.status = Sample.Status.ABORTED
+        self.trainer_model_id = None
         self.non_generation_time = 0.0
         self.spec_info = Sample.SpecInfo()
         self.prefix_cache_info = Sample.PrefixCacheInfo()

@@ -2,8 +2,10 @@
 """
 Post Miles CI health cards to a Lark group via an incoming webhook.
 
-Used by .github/workflows/ci-lark-notify.yml. Needs GITHUB_TOKEN and
-LARK_WEBHOOK, or --dry-run to print the card JSON instead of posting.
+Used by .github/workflows/ci-lark-notify.yml (scheduled PR Test results),
+.github/workflows/docker-build.yml (failed automatic image builds), and
+.github/workflows/build-wheels.yml (failed wheel builds and publication). Needs
+GITHUB_TOKEN and LARK_WEBHOOK, or --dry-run to print the card JSON instead of posting.
 """
 
 import argparse
@@ -103,6 +105,23 @@ class GitHub:
 
     def run_attempt_jobs(self, run_id: int, attempt: int) -> list:
         return self.paginate(f"repos/{self.repo}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+
+    def rerun_failed_jobs(self, run_id: int) -> None:
+        url = f"{GITHUB_API}/repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs"
+        req = urllib.request.Request(url, data=b"", method="POST")
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"POST {url} -> {e.code}: {body[:300]}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"POST {url} failed: {e}") from e
+        if status != 201:
+            raise RuntimeError(f"POST {url} -> {status}")
 
     def paginate_list(self, path: str, params: dict | None = None, max_pages: int = 10) -> list:
         params = dict(params or {})
@@ -352,14 +371,33 @@ def analysis_md(analysis: Any, repo: str) -> list[str]:
     return lines
 
 
+def group_identical_failures(jobs: list, reasons: dict | None) -> list[tuple[tuple, list]]:
+    """One defect can fail every shard the same way, and repeating it per job buries the rest.
+
+    Jobs group only on an identical, non-empty analysis: without one there is nothing to
+    compare, so those rows stay separate as before.
+    """
+    groups: list[tuple[tuple, list]] = []
+    members_by_analyses: dict[tuple, list] = {}
+    for job in jobs:
+        analyses = tuple((reasons or {}).get(job.get("id")) or ())
+        if analyses and analyses in members_by_analyses:
+            members_by_analyses[analyses].append(job)
+            continue
+        members = [job]
+        groups.append((analyses, members))
+        if analyses:
+            members_by_analyses[analyses] = members
+    return groups
+
+
 def list_jobs_md(
     jobs: list, limit: int = MAX_LISTED_JOBS, reasons: dict | None = None, repo: str = DEFAULT_REPO
 ) -> str:
     lines = []
-    for job in jobs[:limit]:
-        lines.append(f"- [{job['name']}]({job['html_url']})")
-        analysis = (reasons or {}).get(job.get("id"))
-        if analysis:
+    for analyses, members in group_identical_failures(jobs[:limit], reasons):
+        lines.append("- " + ", ".join(f"[{job['name']}]({job['html_url']})" for job in members))
+        for analysis in analyses:
             lines.extend(analysis_md(analysis, repo))
     if len(jobs) > limit:
         lines.append(f"- ... and {len(jobs) - limit} more")
@@ -411,19 +449,21 @@ def render_ci_status(
     sha = run["head_sha"]
     subject = ((run.get("head_commit") or {}).get("message") or "").splitlines()
     commit_md = f"[`{sha[:9]}`]({repo_url}/commit/{sha}) {subject[0] if subject else ''}"
-    rerun_prefix = f"Rerun #{attempt} - " if attempt > 1 else ""
+    diff = diff_attempts(failed, prev_failed) if prev_failed is not None else None
+    flaky = diff["fixed"] if diff else []
+    flaky_note = f", {len(flaky)} flaky" if flaky else ""
 
     if conclusion == "cancelled":
-        title = f"{rerun_prefix}{name}: CANCELLED"
+        title = f"{name}: CANCELLED"
         color = "grey"
     elif failed:
-        title = f"{rerun_prefix}{name}: FAILED ({len(failed)} of {plural(len(counted), 'job')})"
+        title = f"{name}: FAILED ({len(failed)} of {plural(len(counted), 'job')}{flaky_note})"
         color = "red"
     else:
-        title = f"{rerun_prefix}{name}: PASSED ({plural(len(counted), 'job')})"
+        title = f"{name}: PASSED ({plural(len(counted), 'job')}{flaky_note})"
         color = "green"
 
-    jobs_summary = f"{len(counted)} total, {len(failed)} failed"
+    jobs_summary = f"{len(counted)} total, {len(failed)} failed{flaky_note}"
     if cancelled:
         jobs_summary += f", {len(cancelled)} cancelled"
     commit_label = "Tested main commit" if run["event"] == "schedule" else "Commit"
@@ -441,17 +481,16 @@ def render_ci_status(
 
     sections = []
     # None: first attempt, nothing to compare against
-    if prev_failed is None:
+    if diff is None:
         if failed:
             sections.append(
                 f"**Failed jobs ({len(failed)})**\n"
                 f"{list_jobs_md(list(failed.values()), reasons=analysis.reasons if analysis else None, repo=repo)}"
             )
     else:
-        diff = diff_attempts(failed, prev_failed)
         remaining_current_jobs = MAX_LISTED_JOBS
         for key, heading in (
-            ("fixed", "Fixed by rerun"),
+            ("fixed", "Flaky, passed on rerun"),
             ("still", "Still failing"),
             ("new", "New failures"),
         ):
@@ -485,10 +524,26 @@ def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
         return
     jobs = gh.run_jobs(run["id"])
     attempt = run.get("run_attempt", 1)
+    failed = failed_job_names(jobs)
+    # failed nightly jobs get one automatic rerun; the card follows that attempt, so failed means failed twice
+    rerun_error = None
+    if attempt == 1 and failed and run["event"] == "schedule" and run.get("conclusion") != "cancelled":
+        if args.dry_run:
+            print(f"dry-run: would rerun {plural(len(failed), 'failed job')} of run {run['id']}")
+            return
+        try:
+            gh.rerun_failed_jobs(run["id"])
+        except RuntimeError as exc:
+            # a refused rerun must not cost the nightly its report: post attempt 1, then fail
+            rerun_error = exc
+        else:
+            print(
+                f"rerun requested for {plural(len(failed), 'failed job')} of run {run['id']}; card follows attempt 2"
+            )
+            return
     prev_failed = None
     if attempt > 1:
         prev_failed = failed_job_names(gh.run_attempt_jobs(run["id"], attempt - 1))
-    failed = failed_job_names(jobs)
     current_failed = list(failed.values())
     if prev_failed is not None:
         diff = diff_attempts(failed, prev_failed)
@@ -509,6 +564,48 @@ def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
             print(f"ci_failure_analysis_unexpected={type(exc).__name__}", file=sys.stderr)
             analysis = AnalysisOutcome(enabled=True, reasons={}, unavailable=True)
     post_card(render_ci_status(run, jobs, prev_failed, analysis, args.repo), args.webhook, args.dry_run)
+    if rerun_error is not None:
+        raise rerun_error
+
+
+# --------------------------------------------------------------------------
+# build failures
+# --------------------------------------------------------------------------
+
+
+def failed_steps(job: dict) -> list[str]:
+    return [step["name"] for step in job.get("steps") or [] if step.get("conclusion") in FAILED_CONCLUSIONS]
+
+
+def render_build_failure(run: dict, failed: list) -> dict:
+    repo_url = run["html_url"].split("/actions/")[0]
+    sha = run["head_sha"]
+    subject = ((run.get("head_commit") or {}).get("message") or "").splitlines()
+    commit_md = f"[`{sha[:9]}`]({repo_url}/commit/{sha}) {subject[0] if subject else ''}"
+    trigger = "Scheduled rebuild" if run["event"] == "schedule" else f"{run['event']} to {run['head_branch']}"
+    rows = []
+    for job in failed[:MAX_LISTED_JOBS]:
+        steps = ", ".join(f"`{name}`" for name in failed_steps(job))
+        rows.append(f"- [{job['name']}]({job['html_url']})" + (f" at {steps}" if steps else ""))
+    if len(failed) > MAX_LISTED_JOBS:
+        rows.append(f"- ... and {len(failed) - MAX_LISTED_JOBS} more")
+    elements = [
+        md(f"{grey('Miles commit')}  {commit_md}"),
+        kv_columns([("Trigger", trigger), ("Started", fmt_local(parse_time(run.get("run_started_at"))))]),
+        HR,
+        md(f"**Failed jobs ({len(failed)})**\n" + "\n".join(rows)),
+    ]
+    return build_card(f"{run['name']}: FAILED", "red", elements, [("View run on GitHub", run["html_url"])])
+
+
+def cmd_build_failure(args: argparse.Namespace, gh: GitHub) -> None:
+    # Runs as a job of the build's own workflow run, so the run is still in progress.
+    run = gh.run(args.run_id)
+    failed = [job for job in gh.run_jobs(run["id"]) if job.get("conclusion") in FAILED_CONCLUSIONS]
+    if not failed:
+        print(f"run {args.run_id} has no failed job; skipping")
+        return
+    post_card(render_build_failure(run, failed), args.webhook, args.dry_run)
 
 
 # --------------------------------------------------------------------------
@@ -528,6 +625,12 @@ def main() -> int:
     p.add_argument("--run-id", type=int, required=True)
     p.add_argument("--any-event", action="store_true", help="also report non-schedule runs")
 
+    p = sub.add_parser("docker-build-failure", help="report a failed automatic Docker image build")
+    p.add_argument("--run-id", type=int, required=True)
+
+    p = sub.add_parser("wheels-build-failure", help="report a failed wheel build or publication")
+    p.add_argument("--run-id", type=int, required=True)
+
     args = parser.parse_args()
     if not args.token:
         print("GITHUB_TOKEN (or --token) is required", file=sys.stderr)
@@ -537,7 +640,12 @@ def main() -> int:
         return 2
 
     gh = GitHub(args.token, args.repo)
-    cmd_ci_status(args, gh)
+    commands = {
+        "ci-status": cmd_ci_status,
+        "docker-build-failure": cmd_build_failure,
+        "wheels-build-failure": cmd_build_failure,
+    }
+    commands[args.command](args, gh)
     return 0
 
 

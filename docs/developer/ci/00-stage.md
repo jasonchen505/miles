@@ -23,7 +23,7 @@ Stage names follow `stage-<tier>-<gpus>-<hw>` (or `stage-<tier>-<hw>` for CPU, e
 | `stage-b-2-gpu-h200` | 2× H200 | `["h200","2gpu"]` | 1 | both resolvers, `stage-a-cpu` |
 | `stage-c-2-gpu-h200` | 2× H200 | `["h200","2gpu"]` | 2 | both resolvers, `stage-a-cpu` |
 | `stage-c-4-gpu-h200` | 4× H200 | `["h200","4gpu"]` | 3 | both resolvers, `stage-a-cpu` |
-| `stage-c-8-gpu-h100` | 8× H100 | `["h100","8gpu"]` | 2 | both resolvers, `stage-a-cpu` |
+| `stage-c-8-gpu-h100` | 8× H100 | `["h100","8gpu"]` | 1 | both resolvers, `stage-a-cpu` |
 | `stage-c-8-gpu-h200` | 8× H200 | `["h200","8gpu"]` | 2 | both resolvers, `stage-a-cpu` |
 | `stage-c-8-gpu-b200` | 8× B200 | `["b200","8gpu"]` | 1 | both resolvers, `stage-a-cpu` |
 | `stage-c-4-gpu-mi350` | 4× MI350 | `["self-hosted","amd","mi350","4gpu"]` | 2 | both resolvers |
@@ -37,20 +37,22 @@ In `pr-test.yml`, `tier a` (CPU fast) gates PR-image preparation and the NVIDIA 
 
 `pr-test.yml` treats `pull_request.closed` as cancellation-only: the close event shares the PR's concurrency group, cancels any queued or running `PR Test` run, and starts no resolver or test jobs.
 
-Both PR workflows are also reusable `workflow_call` entry points for release CI. Called runs group concurrency by `inputs.ref`, so redispatching the same release branch cancels the older run; literal `pr-test-` and `pr-test-rocm-` prefixes keep the CUDA and ROCm groups from cancelling each other under the same branch-cut caller.
+A PR event starts jobs only when the PR's base is the default branch or the PR carries a `run-ci*` label. Otherwise `resolve-ci-policy` is skipped, and because every other job needs it, the run starts nothing. A stacked PR therefore runs `PR Test` only while labeled; retargeting a PR to `main` is an `edited` event, which does not start a run.
+
+Both PR workflows expose reusable `workflow_call` entry points. Release CI calls only `pr-test.yml` for CPU and CUDA coverage. Called runs group concurrency by `inputs.ref`, so redispatching the same release branch cancels the older run; literal `pr-test-` and `pr-test-rocm-` prefixes keep the two workflows in separate concurrency groups.
 
 ## What each stage does
 
-**Image resolution (`resolve-ci-image`).** In `pr-test.yml`, a small `ubuntu-latest` job takes the called workflow's `image_tag` first, then reads `ci-image-tag:` from the PR description or the `ci_image_tag` dispatch input, defaults to `dev`, validates the result is a bare tag, and outputs `radixark/miles:<tag>`. `release-branch-cut.yml` passes the prune-exempt `release-vX.Y.Z-ci` tag recorded in `release-lock.json`.
+**Image resolution (`resolve-ci-image`).** In `pr-test.yml`, a small `ubuntu-latest` job selects, in order: the called workflow's `image_tag`, the `ci_image_tag` dispatch input, a current `pr-<num>` image, the PR description's `ci-image-tag:`, then `dev`. It validates the result is a bare tag and outputs `radixark/miles:<tag>`. `release-branch-cut.yml` passes the prune-exempt `release-vX.Y.Z-ci` tag recorded in `release-lock.json`.
 
-The ROCm resolver uses only its dispatch input, defaults to its undated `rocm/sgl-dev` tag, and uses that default for called release runs too.
+The ROCm resolver uses only its dispatch input, defaults to its undated `rocm/sgl-dev` tag, and uses that default for reusable calls too. For PRs, it runs only when `stage-c-4-gpu-mi350` is selected. CPU-only PRs skip both CUDA image preparation and ROCm image resolution.
 
 Distinct from image selection, the **`run-ci-image` label** selects the test scope — every enabled tag except `long`, `ft-short`, and `ft-long` — which validates an image bump without selecting those domains implicitly.
 
 **Policy resolution (`resolve-ci-policy`).**
 
 - `pull_request`, `schedule`, and `workflow_dispatch` only say how the workflow started; none itself implies a cadence or domain scope.
-- Each Miles PR workflow passes trigger facts and, for PRs, the diff to `tests/ci/ci_policy.py`, which publishes the resolved policy and `skipped_stages` for `run_suite.py` and GPU job gates.
+- Each Miles PR workflow passes trigger facts and, for PRs, the diff to `tests/ci/ci_policy.py`, which publishes the resolved policy and `skipped_stages` for `run_suite.py` and GPU job gates. `needs_cuda_image` derives from that selection and gates CUDA image preparation.
 - A PR `nightly` label maps to nightly cadence.
 - A scheduled run maps its exact UTC `github.event.schedule` cron: `0 15 * * 0-5` maps to nightly and `0 15 * * 6` maps to weekly; an unknown cron fails.
 - A manual dispatch keeps regular cadence and has no PR labels. Both GPU workflows add `--match-all-labels` so an explicit manual operation runs the full regular GPU suites; CPU selection remains unchanged.
@@ -62,11 +64,19 @@ A **nightly** policy selects every enabled tag except `long` and `ft-long`, admi
 
 **PR GPU stage selection.** Before runner allocation, PR GPU stages are filtered by `runnable ∩ affected`: `runnable` reuses cadence/label selection, while `affected` maps changed registered tests to their suites. Known non-GPU paths affect none; unknown, missing, or malformed diffs affect all. `nightly`, `run-ci-all`, and `run-ci-image` add their runnable stages; `bypass-fastfail` does not. CPU stages and scheduled/manual runs are not filtered.
 
-**Dependencies / gating.** In `pr-test.yml`, both CPU stages require only `resolve-ci-policy`. PR-image preparation is gated by `stage-a-cpu`, and the NVIDIA GPU stages follow image resolution; `stage-b-cpu` stays parallel and does not gate that chain. Resolved nightly, weekly, or release cadence and the `bypass-fastfail` PR label admit the chain after an actual `stage-a-cpu` failure and make each suite continue after a test failure; none bypasses policy or Docker/image failure.
+**Dependencies / gating.** In `pr-test.yml`, both CPU stages require only `resolve-ci-policy`. PR-image preparation requires selected CUDA tests and the `stage-a-cpu` success/bypass gate; NVIDIA GPU stages follow image resolution. `stage-b-cpu` stays parallel and does not gate that chain. Resolved nightly, weekly, or release cadence and the `bypass-fastfail` PR label admit the chain after an actual `stage-a-cpu` failure and make each suite continue after a test failure. This fast-fail exception does not itself select GPU tests or bypass policy or Docker/image failure; cadence and labels determine selection as described above. Scheduled, manual, and called release runs retain their existing image preparation.
 
 **Runner selection.** CUDA stages request runners by label via `runs_on`, a JSON list passed through to `runs-on` — a runner must carry **all** listed labels (GPU class + count). CPU stages call `_run-cpu-ci.yml`, whose only job runs on GitHub-hosted `ubuntu-latest`, so they don't occupy GPU-fleet slots.
 
-**Dependency boundary.** CUDA stages start from dependencies baked into `radixark/miles`, reconcile Miles runtime dependencies from `requirements.txt`, update the SGLang and Megatron-LM checkouts to the selected refs, and expose all three source trees through `PYTHONPATH`; they do not rebuild or install the Miles, SGLang, or Megatron-LM source trees after the container starts. The hosted CPU stages install dependencies from `requirements.txt` and the fully pinned `tests/ci/requirements-ci-cpu.txt`, then expose the Miles, SGLang, and Megatron-LM source trees through `PYTHONPATH` without editable installs or inline package lists. The ROCm stage instead uses the SGLang and Megatron-LM versions baked into `rocm/sgl-dev`, unless the run names a ref for either.
+**Arch dispatch.** `tests/ci/hardware.py::CUDA_STAGES` is the single source of truth for the CUDA taxonomy: each stage's GPU generation, GPU count, and runner labels. `CI_SUITES` and the `/rerun-test` runner map both derive from it, and a stage's `--suite` already names its generation, so no job passes an arch explicitly.
+
+A test normally runs at its home stage. A [dispatch label](/developer/ci/01-label) can send it to another generation instead, in which case the destination is the smallest stage on that generation with enough GPUs — a test declares its own GPU budget through `ray start --num-gpus` / `torchrun --nproc-per-node` rather than reading the devices it can see, so a wider stage simply leaves the surplus idle. Today every dispatched test lands on `stage-c-8-gpu-b200`, the only Blackwell stage; partitioning a second Blackwell host adds narrower stages and routing follows automatically.
+
+Without a dispatch label nothing leaves its home stage, so scheduled and called runs are unaffected. Whatever stage actually executes a run is also the stage its performance baseline is keyed on, keeping the generations' numbers apart.
+
+**Dependency boundary.** CUDA stages start from dependencies baked into `radixark/miles` and install `examples/multi_lora/requirements.txt` before `requirements.txt` through `tests/ci/reconcile_dependencies.py`. Installed CUDA 12/13 cuDNN versions are preserved with uv overrides; images without cuDNN use pip. Before each install, a dry-run gate rejects replacement of installed GPU runtimes or packages with at least 100 MiB of recorded installed files, including same-version reinstalls. These packages must be updated in the image.
+
+CUDA stages then update the SGLang and Megatron-LM checkouts to the selected refs and expose all three source trees through `PYTHONPATH`; they do not rebuild or install those source trees after the container starts. Hosted CPU stages install `requirements.txt` and the fully pinned `tests/ci/requirements-ci-cpu.txt`, then expose the source trees through `PYTHONPATH` without editable installs or inline package lists. The ROCm stage uses the SGLang and Megatron-LM versions baked into `rocm/sgl-dev`, unless the run names a ref for either.
 
 CUDA and CPU dependency refs resolve in this order: explicit dispatch input or PR-body directive, committed `release-lock.json`, then the moving `sglang-miles` / `miles-main` branch heads. A called release run therefore checks out its requested Miles `ref` and consumes the lockfile on that ref unless an explicit override exists. ROCm checks out the requested Miles ref but keeps the dependencies baked into its image unless the run names a ref for one.
 
@@ -80,11 +90,11 @@ Both workflows receive `execute_command` and an optional `ref`; CUDA callers add
 
 Weekly runs keep the same shards but set each GPU matrix's `max-parallel` to one, so each stage occupies at most one matching runner. Stages remain independent: `stage-b-2-gpu-h200` and `stage-c-2-gpu-h200` may each occupy one 2-GPU runner at the same time. PR, nightly, and release runs retain their existing matrix parallelism.
 
-## ROCm PR/nightly/weekly/release mirror
+## ROCm PR/nightly/weekly mirror
 
 `pr-test-rocm.yml` exposes `pull_request`, exact nightly and weekly crons, `workflow_dispatch`, and `workflow_call`. PR runs use the same low-trust merge-commit model as `pr-test.yml`. It runs `stage-c-4-gpu-mi350` through `_run-ci-rocm.yml` on two 4-GPU MI350 runners and splits tests into two `est_time`-balanced shards; weekly alone limits the matrix to one runner at a time. It runs no CPU tests.
 
-A called release run checks out the supplied Miles `ref` with `cadence=release` but resolves the same undated `rocm/sgl-dev:miles-rocm720-mi35x` image as the other automatic paths. SGLang and Megatron-LM remain baked into that image, so release ROCm is a smoke signal and manual dispatch exposes no dependency-ref inputs.
+Reusable calls can select a Miles `ref` and cadence, but resolve the same undated `rocm/sgl-dev:miles-rocm724-mi35x` image as the other automatic paths. SGLang and Megatron-LM remain baked into that image. The release branch-cut workflow does not call ROCm CI or include it in the `release-ci` gate.
 
 Only tests registered with `register_rocm_ci(suite="stage-c-4-gpu-mi350", ...)` run; the `nightly-` prefixed suites and CUDA registrations are not inherited. PR, nightly, weekly, and release runs consume the shared cadence and label policy: `run-ci-amd` selects the `amd`-labelled subset, other `run-ci-*` labels select matching subsets, nightly admits regular plus `nightly=True` registrations, and weekly or release selects every enabled registration.
 
@@ -96,7 +106,7 @@ An 8-GPU CUDA case needs a separate 4-GPU `test_amd_<name>.py` variant rather th
 
 Both runner containers can see all eight host GPUs through `/dev/dri`. Each runner restricts itself to four GPUs with `HIP_VISIBLE_DEVICES`, which `_run-ci-rocm.yml` forwards into the container.
 
-**External MI350 nightly.** Miles declares `nightly-stage-c-2-gpu-mi350`, `nightly-stage-c-4-gpu-mi350`, and `nightly-stage-c-8-gpu-mi350` in `CI_SUITES` for the external nightly, and keeps the unprefixed `stage-c-4-gpu-mi350` for its own `pr-test-rocm.yml`. The three prefixed suites are run by the external [`sgl-project/sglang` ROCm 7.2 nightly workflow](https://github.com/sgl-project/sglang/blob/main/.github/workflows/nightly-test-amd-miles-rocm720.yml).
+**External MI350 nightly.** Miles declares `nightly-stage-c-2-gpu-mi350`, `nightly-stage-c-4-gpu-mi350`, and `nightly-stage-c-8-gpu-mi350` in `CI_SUITES` for the external nightly, and keeps the unprefixed `stage-c-4-gpu-mi350` for its own `pr-test-rocm.yml`. The three prefixed suites are run by the external [`sgl-project/sglang` ROCm 10 nightly workflow](https://github.com/sgl-project/sglang/blob/main/.github/workflows/nightly-test-amd-miles-rocm10.yml).
 
 ## Assumptions
 

@@ -7,11 +7,14 @@ from miles.ray.rollout.metrics import (
     _compute_episode_response_length_metrics,
     _compute_metrics_from_samples,
     _compute_passrate_from_samples,
+    _compute_spec_metrics,
     _compute_training_sample_metrics,
     _compute_zero_std_metrics,
+    log_eval_rollout_data,
     log_rollout_data,
 )
-from miles.utils.types import AdapterRef, Sample, WeightVersionSpan, WeightVersionsPerCall
+from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
 class TestEpisodeResponseLengthMetrics:
@@ -59,18 +62,6 @@ class TestEpisodeResponseLengthMetrics:
 
         assert out["episode_response_length/mean"] == pytest.approx(4.5)
         assert out["episode_total_response_length/mean"] == pytest.approx(8.0)
-
-    def test_multi_lora_samples_emit_no_episode_length_metrics(self):
-        samples = [
-            make_sample(index=0, rollout_id=10, adapter=AdapterRef(name="adapter-a", slot=0)),
-            make_sample(index=0, rollout_id=10, adapter=AdapterRef(name="adapter-b", slot=1)),
-        ]
-
-        assert _compute_episode_response_length_metrics(samples) == {}
-        out = _compute_metrics_from_samples(make_args(advantage_estimator="ppo"), samples)
-        assert not any(key.startswith("episode_response_length/") for key in out)
-        assert "episode_total_response_length/mean" not in out
-        assert out["response_len/mean"] == pytest.approx(4.0)
 
     def test_removed_sample_has_zero_effective_length_but_keeps_total_length(self):
         sample = make_sample(
@@ -120,21 +111,6 @@ class TestTrainingSampleMetrics:
             make_sample(group_index=0, index=0, rollout_id=10, reward=1.0),
             make_sample(group_index=0, index=0, rollout_id=10, reward=1.0),
             make_sample(group_index=1, index=1, rollout_id=10, reward=0.0),
-        ]
-
-        out = _compute_training_sample_metrics(args, samples)
-
-        assert out["episode_raw_reward"] == pytest.approx(0.5)
-
-    def test_rollout_ids_are_scoped_by_adapter(self):
-        args = make_args(reward_key=None)
-        adapter_a = AdapterRef(name="adapter-a", slot=0)
-        adapter_b = AdapterRef(name="adapter-b", slot=1)
-        samples = [
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_a, reward=1.0),
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_a, reward=1.0),
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_a, reward=1.0),
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_b, reward=0.0),
         ]
 
         out = _compute_training_sample_metrics(args, samples)
@@ -204,6 +180,86 @@ class TestComputeZeroStdMetrics:
         assert "zero_std/all_one_percentage" not in out
 
 
+class TestComputeSpecMetrics:
+    def test_aggregates_sglang_counters_before_computing_ratios(self):
+        args = make_args(sglang_speculative_algorithm="EAGLE")
+        samples = make_samples_grouped(1, 2)
+        samples[0].spec_info = Sample.SpecInfo(
+            spec_num_correct_drafts=1,
+            spec_num_proposed_drafts=2,
+            spec_verify_ct=1,
+            completion_tokens=2,
+        )
+        samples[1].spec_info = Sample.SpecInfo(
+            spec_num_correct_drafts=9,
+            spec_num_proposed_drafts=10,
+            spec_verify_ct=9,
+            completion_tokens=27,
+        )
+
+        out = _compute_spec_metrics(args, samples)
+
+        assert out == {
+            "spec_accept_rate": pytest.approx(10 / 12),
+            "spec_accept_length": pytest.approx(29 / 10),
+        }
+
+    @staticmethod
+    def _member(session_id, metrics, *, group_index=0, rollout_id=0):
+        sample = Sample(group_index=group_index, index=rollout_id, rollout_id=rollout_id)
+        sample.metadata[SESSION_ROLLOUT_METRICS_KEY] = {
+            "session_id": session_id,
+            "metrics": metrics,
+        }
+        return sample
+
+    @staticmethod
+    def _spec_info(correct, proposed, verify, completion):
+        return {
+            "spec_info": {
+                "spec_num_correct_drafts": correct,
+                "spec_num_proposed_drafts": proposed,
+                "spec_verify_ct": verify,
+                "completion_tokens": completion,
+            }
+        }
+
+    def test_v2_deduplicates_session_carriers_and_includes_ordinary_samples(self):
+        args = make_args(sglang_speculative_algorithm="EAGLE", use_session_server="v2")
+        session_1_metrics = self._spec_info(2, 4, 2, 6)
+        ordinary_sample = Sample(
+            spec_info=Sample.SpecInfo(
+                spec_num_correct_drafts=3,
+                spec_num_proposed_drafts=5,
+                spec_verify_ct=2,
+                completion_tokens=5,
+            )
+        )
+        samples = [
+            self._member("sid-1", session_1_metrics, rollout_id=10),
+            self._member("sid-1", session_1_metrics, rollout_id=10),
+            ordinary_sample,
+        ]
+        for sample in samples[:2]:
+            sample.spec_info = Sample.SpecInfo(
+                spec_num_correct_drafts=100,
+                spec_num_proposed_drafts=100,
+                spec_verify_ct=1,
+                completion_tokens=100,
+            )
+
+        out = _compute_spec_metrics(args, samples)
+
+        assert out == {
+            "spec_accept_rate": pytest.approx(5 / 9),
+            "spec_accept_length": pytest.approx(11 / 4),
+        }
+        assert _compute_spec_metrics(args, [ordinary_sample]) == {
+            "spec_accept_rate": pytest.approx(3 / 5),
+            "spec_accept_length": pytest.approx(5 / 2),
+        }
+
+
 class TestTitoMismatchMetrics:
     def test_no_tito_metadata_emits_no_tito_keys(self):
         args = make_args(advantage_estimator="ppo", ci_test=False, log_passrate=False)
@@ -256,6 +312,35 @@ class TestTitoMismatchMetrics:
             match=r"tito_session_mismatch_rate/v1/special_token_count=0\.2500",
         ):
             _compute_metrics_from_samples(args, samples)
+
+    @pytest.mark.parametrize(
+        ("mismatch_type", "threshold", "raises"),
+        [
+            ("special_token_count", 0.25, False),
+            ("special_token_count", 0.2, True),
+            ("special_token_type", 0.25, True),
+        ],
+    )
+    def test_special_token_count_threshold_under_ci_test(self, mismatch_type, threshold, raises):
+        """The special_token_count threshold only relaxes that type; the
+        other strict types stay at 0."""
+        args = make_args(
+            advantage_estimator="ppo",
+            ci_test=True,
+            ci_tito_special_token_count_threshold=threshold,
+            log_passrate=False,
+            use_session_server="v2",
+        )
+        samples = make_samples_grouped(1, 4)
+        samples[0].metadata = {"tito_session_mismatch": [{"type": mismatch_type}]}
+        for s in samples[1:]:
+            s.metadata = {"tito_session_mismatch": []}
+        if raises:
+            with pytest.raises(AssertionError, match=rf"tito_session_mismatch_rate/v2/{mismatch_type}=0\.2500"):
+                _compute_metrics_from_samples(args, samples)
+        else:
+            out = _compute_metrics_from_samples(args, samples)
+            assert out[f"tito_session_mismatch_rate/v2/{mismatch_type}"] == 0.25
 
     def test_assistant_text_mismatch_does_not_raise_under_ci_test(self):
         """assistant_text mismatch is non-critical (tokens inherited from the
@@ -399,3 +484,38 @@ def _make_versioned_sample(versions: list[str], *, index: int) -> Sample:
         WeightVersionsPerCall(spans=[WeightVersionSpan(version, i, i + 1)]) for i, version in enumerate(versions)
     ]
     return sample
+
+
+class TestLogRolloutData:
+    def test_the_model_id_comes_from_the_caller_not_from_the_args(self, monkeypatch):
+        """One rollout executor serves every policy, so the id must travel with the call, not with the run."""
+        calls: list[tuple[dict, str]] = []
+        monkeypatch.setattr(
+            "miles.ray.rollout.metrics.tracking.log",
+            lambda _args, payload, step_key: calls.append((payload, step_key)),
+        )
+        args = make_args(advantage_estimator="ppo", ci_test=False, log_passrate=False, trainer_model_id=None)
+
+        log_rollout_data(0, args, make_samples_grouped(1, 4), None, 1.0, trainer_model_id="alpha")
+
+        [(payload, step_key)] = calls
+        assert step_key == "alpha/rollout/step"
+        assert all(key.startswith("alpha/") for key in payload)
+
+
+class TestEvalMetrics:
+    def test_eval_metrics_are_not_namespaced_by_policy(self, monkeypatch):
+        """Pinning the status quo: a run training several policies is refused an eval, so eval keeps one step axis."""
+        calls: list[tuple[dict, str]] = []
+        monkeypatch.setattr(
+            "miles.ray.rollout.metrics.tracking.log",
+            lambda _args, payload, step_key: calls.append((payload, step_key)),
+        )
+        args = make_args(log_passrate=False, trainer_model_id="alpha")
+
+        log_eval_rollout_data(0, args, {"gsm8k": {"rewards": [1.0, 0.0]}})
+
+        [(payload, step_key)] = calls
+        assert step_key == "eval/step"
+        assert payload["eval/gsm8k"] == 0.5
+        assert not any(key.startswith("alpha/") for key in payload)

@@ -8,7 +8,7 @@ This guide is for contributors landing small features and fixes. It answers thre
 
 CI selection is driven by a one-line declaration at the top of each test file, not by the workflow. To add a test you drop a `test_*.py` file in the right place and declare it; the runner discovers it automatically.
 
-**CPU / pure-Python tests** go under `tests/fast/`. No declaration needed — every `test_*.py` there is auto-registered as a CPU test and runs on every PR.
+**CPU / pure-Python tests** go under `tests/fast/`. No declaration needed — every `test_*.py` there is auto-registered as a CPU test and runs in every `PR Test` run.
 
 **GPU tests** go under `tests/e2e/` (or `tests/fast-gpu/` for small single-file GPU tests) and need exactly one top-level declaration:
 
@@ -17,12 +17,13 @@ from tests.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=600,                  # rough seconds the test takes; used to balance + time-out
-    suite="stage-c-4-gpu-h200",    # which hardware bucket runs it (table below)
+    suite="stage-c-4-gpu-h200",    # home stage (table below)
     labels=["megatron"],           # required; see "Will it run on my PR?"
+    hardware=["hopper", "blackwell"],  # required; supported CUDA generations
 )
 ```
 
-Pick the `suite` by the hardware your test needs. The simplest reliable choice is to copy the `suite=` of an existing test most like yours.
+Pick the `suite` by the hardware your test needs. The simplest reliable choice is to copy the `suite=` of an existing test most like yours. List every supported CUDA generation in `hardware`, with the generation matching the home `suite` first.
 
 | Suite | Runs on | Use for |
 |---|---|---|

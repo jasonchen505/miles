@@ -11,7 +11,6 @@ welcome: bug reports, doc fixes, new model recipes, full features.
 miles/
 ├── train.py                  # synchronous entry point
 ├── train_async.py            # fully-async entry point
-├── train_multi_lora_async.py # multi-LoRA async entry point
 ├── miles/                    # the package
 │   ├── backends/
 │   │   ├── megatron_utils/   # Megatron actor, weight sync, checkpointing, fp32 markers
@@ -136,8 +135,10 @@ convention exists to prevent.
 
 ### What a PR runs
 
-Two things start automatically on every PR: the `pre-commit` workflow, and `PR Test`
-(`.github/workflows/pr-test.yml`). `PR Test` resolves a policy and an image, runs the two
+Two things start automatically: the `pre-commit` workflow on every PR, and `PR Test`
+(`.github/workflows/pr-test.yml`) on every PR based on `main`. A PR based on another branch,
+such as a stacked PR, runs `PR Test` only with a `run-ci*` label (see
+[Labels](/developer/ci/01-label)). `PR Test` resolves a policy and an image, runs the two
 CPU stages, and then the GPU stages, which are gated on `stage-a-cpu` succeeding so a
 formatting or import error does not burn GPU time. A PR that touches `docker/Dockerfile`,
 `docker/build.py`, `docker/verify_transformer_engine.py`, `docker/patch/**` or
@@ -148,8 +149,8 @@ formatting or import error does not burn GPU time. A PR that touches `docker/Doc
 Selection is declared in the test file, never in the workflow YAML.
 
 - **CPU tests go in `tests/fast/`.** Every `test_*.py` there is auto-registered as a CPU
-  test in `stage-a-cpu` with no labels, and runs on every PR. A `register_cuda_ci` under
-  `tests/fast/` is a hard error; move the file to `tests/fast-gpu/`.
+  test in `stage-a-cpu` with no labels, and runs in every `PR Test` run. A
+  `register_cuda_ci` under `tests/fast/` is a hard error; move the file to `tests/fast-gpu/`.
 - **Everywhere else, register explicitly.** One top-level call per file:
 
 ```python
@@ -157,12 +158,13 @@ from tests.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=600,                 # rough seconds; balances shards and sets the per-file timeout
-    suite="stage-c-4-gpu-h200",   # the hardware bucket that runs it
+    suite="stage-c-4-gpu-h200",   # the home stage that runs it by default
     labels=["megatron"],          # required for CUDA and ROCm tests
+    hardware=["hopper", "blackwell"],  # required CUDA generations
 )
 ```
 
-`register_cpu_ci` allows empty labels for always-on CPU coverage; `register_cuda_ci` and `register_rocm_ci` require a non-empty domain-label list. All three also accept `nightly=True` (nightly, weekly, and release cadence only) and `disabled="<reason + issue link>"` (reported as skipped rather than deleted). The calls are parsed from the AST, so they must be top-level, literal, and unaliased.
+`register_cpu_ci` allows empty labels for always-on CPU coverage; `register_cuda_ci` and `register_rocm_ci` require a non-empty domain-label list. `register_cuda_ci` also requires a non-empty `hardware` list, with the generation matching its home `suite` first. All three accept `nightly=True` (nightly, weekly, and release cadence only) and `disabled="<reason + issue link>"` (reported as skipped rather than deleted). The calls are parsed from the AST, so they must be top-level, literal, and unaliased.
 
 The runner scans `tests/fast`, `tests/fast-gpu`, `tests/e2e` and `tests/ci` for
 `test_*.py`, and a file outside `tests/fast/` with no registration fails collection with

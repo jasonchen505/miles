@@ -10,7 +10,9 @@ else:
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 from tests.ci.metric_history import register_ci_gate
 
-register_cuda_ci(est_time=1900, suite="stage-c-4-gpu-h200", labels=["megatron", "model-scripts"])
+register_cuda_ci(
+    est_time=1900, suite="stage-c-4-gpu-h200", labels=["megatron", "model-scripts"], hardware=["hopper", "blackwell"]
+)
 register_rocm_ci(
     est_time=1900,
     suite="stage-c-4-gpu-mi350",
@@ -26,7 +28,7 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
-    return ScriptArgs(
+    return ScriptArgs.from_env(
         model_name="DeepSeek-V4-Flash-FP8-4layer",
         dsv4_impl="miles",
         task="gsm8k",

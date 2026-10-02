@@ -15,6 +15,7 @@ parsing fixture files -- the AST-side validation lives in
 `test_ci_register.py`; this module exercises the runtime filter.
 """
 
+import itertools
 import os
 import re
 import subprocess
@@ -51,20 +52,24 @@ def _make(
     est_time: float = 60.0,
     nightly: bool = False,
     disabled: str | None = None,
+    hardware: list[str] | None = None,
 ) -> CIRegistry:
     """Minimal `CIRegistry` factory for filter tests.
 
-    CUDA fixtures default to the `megatron` domain; CPU fixtures default to
-    the always-on empty label set.
+    CUDA fixtures default to the `megatron` domain and to Hopper-only support;
+    CPU fixtures default to the always-on empty label set and no arch.
     """
     if labels is None:
         labels = [] if backend == HWBackend.CPU else ["megatron"]
+    if hardware is None:
+        hardware = ["hopper"] if backend == HWBackend.CUDA else []
     return CIRegistry(
         backend=backend,
         filename=filename,
         est_time=est_time,
         suite=suite,
         labels=list(labels),
+        hardware=list(hardware),
         nightly=nightly,
         disabled=disabled,
         implicit=False,
@@ -86,6 +91,22 @@ class TestBuildCpuPytestCmd:
         assert "-x" not in cmd
         assert cmd[0] == "pytest"
         assert "tests/fast/a.py" in cmd and "tests/fast/b.py" in cmd
+
+    def test_a_directory_is_never_returned_to_after_its_parent(self):
+        """pytest loads a directory's conftest when it first reaches it. Naming that directory again
+        after its parent leaves the second visit's tests without their own conftest's fixtures, which
+        reads as `fixture ... not found` on tests that have always had one."""
+        cmd = build_cpu_pytest_cmd(
+            [
+                "tests/fast/backends/megatron_utils/test_actor.py",
+                "tests/fast/backends/test_fsdp_routing_replay.py",
+                "tests/fast/backends/megatron_utils/test_model.py",
+            ],
+            continue_on_error=True,
+        )
+
+        directories = [name.rsplit("/", 1)[0] for name in cmd if name.endswith(".py")]
+        assert len(set(directories)) == len(list(itertools.groupby(directories)))
 
 
 # --- CI_SUITES locked to the stage taxonomy ---------------------------------
@@ -215,6 +236,39 @@ class TestResolvePolicy:
         # never write the rolling perf baseline.
         assert policy.write_baseline is scheduled_cadence
 
+    @pytest.mark.parametrize(
+        ("labels", "dispatch", "absorb"),
+        [
+            (set(), frozenset(), False),
+            ({"run-ci-megatron"}, frozenset(), False),
+            ({"nightly"}, frozenset(), False),
+            ({"run-on-hopper"}, frozenset({"hopper"}), True),
+            ({"run-on-blackwell"}, frozenset({"blackwell"}), True),
+            ({"run-on-hopper", "run-on-blackwell"}, frozenset({"hopper", "blackwell"}), True),
+            # An arch without permission to leave home: the Blackwell-exclusive set.
+            ({"run-ci-blackwell-only"}, frozenset({"blackwell"}), False),
+            # An explicit `run-on-*` outranks it and re-enables routing.
+            ({"run-ci-blackwell-only", "run-on-blackwell"}, frozenset({"blackwell"}), True),
+        ],
+    )
+    def test_dispatch_resolution(self, labels, dispatch, absorb):
+        cadence = NIGHTLY_CADENCE if "nightly" in labels else REGULAR_CADENCE
+        policy = resolve_policy(cadence, labels)
+        assert policy.dispatch_arches == dispatch
+        assert policy.absorb is absorb
+
+    def test_blackwell_only_selects_every_domain(self):
+        # The arch is the selection, so no domain label may narrow it away.
+        assert resolve_policy(REGULAR_CADENCE, {"run-ci-blackwell-only"}).include_labels == _ALL
+
+    def test_scheduled_cadences_never_absorb(self):
+        # Cron runs carry no labels, so nightly and weekly keep every test on
+        # its home stage no matter how widely it is tagged.
+        for cadence in (NIGHTLY_CADENCE, WEEKLY_CADENCE, RELEASE_CADENCE):
+            policy = resolve_policy(cadence, set())
+            assert policy.absorb is False
+            assert policy.dispatch_arches == frozenset()
+
     def test_unknown_cadence_rejected(self):
         with pytest.raises(ValueError, match="Unknown CI cadence 'hourly'"):
             resolve_policy("hourly", set())
@@ -292,6 +346,13 @@ class TestWorkflowScopeSeam:
         assert "resolve-ci-image" not in stage_a
         assert "resolve-ci-image" not in stage_b
 
+    def test_non_default_base_pr_needs_run_ci_label(self):
+        policy_gate = self._workflow().split("  resolve-ci-policy:", 1)[1].split("    runs-on:", 1)[0]
+
+        assert "github.event.pull_request.base.ref == github.event.repository.default_branch" in policy_gate
+        assert "contains(toJSON(github.event.pull_request.labels.*.name), '\"run-ci')" in policy_gate
+        assert "github.event_name != 'pull_request'" in policy_gate
+
     def test_cpu_and_gpu_stages_use_dedicated_reusable_workflows(self):
         workflow = self._workflow()
         assert workflow.count("uses: ./.github/workflows/_run-cpu-ci.yml") == 2
@@ -360,7 +421,7 @@ class TestWorkflowScopeSeam:
         assert decide_job.index(live_labels) < decide_job.index("- name: Login to Docker Hub")
         assert "LABELS=$(gh api --paginate" in decide_job
         assert 'grep -Fxq "rebuild-ci-image" <<< "$LABELS"' in decide_job
-        assert "github.event.pull_request.labels.*.name" not in reusable
+        assert "github.event.pull_request.labels.*.name" not in decide_job
         assert "needs.docker-decide.outputs.force_rebuild == 'true'" in reusable
 
     def test_policy_job_is_a_thin_python_adapter(self):
@@ -401,7 +462,6 @@ class TestWorkflowScopeSeam:
     def test_weekly_serializes_each_gpu_matrix(self):
         workflow = self._workflow()
         normal_parallelism = {
-            "stage-c-8-gpu-h100": 2,
             "stage-c-8-gpu-h200": 2,
             "stage-c-4-gpu-h200": 3,
             "stage-c-2-gpu-h200": 2,
